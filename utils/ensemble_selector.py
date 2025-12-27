@@ -69,7 +69,7 @@ class EnsembleSelector(BaseEstimator, TransformerMixin):
         score_xgb = rank01(clf_xgb.feature_importances_)
         
         # --- Weighted Sum ---
-        final_score = (0.45 * score_lasso) + (0.35 * score_xgb) + (0.2 * score_mi)
+        final_score = (0.4 * score_lasso) + (0.4 * score_xgb) + (0.2 * score_mi)
         
         # --- Top K ---
         k = min(self.n_features_to_select, n_total)

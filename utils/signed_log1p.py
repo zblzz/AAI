@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 
 # ==========================================
@@ -11,5 +12,10 @@ def signed_log1p_func(X):
 class SignedLog1pTransformer(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
         return self
+
     def transform(self, X):
-        return signed_log1p_func(np.array(X))
+        if isinstance(X, pd.DataFrame):
+            arr = np.sign(X.values) * np.log1p(np.abs(X.values))
+            return pd.DataFrame(arr, columns=X.columns, index=X.index)
+        arr = np.asarray(X)
+        return np.sign(arr) * np.log1p(np.abs(arr))

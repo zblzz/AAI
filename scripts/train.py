@@ -7,10 +7,12 @@ from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import cross_validate, RepeatedStratifiedKFold
+from sklearn.model_selection import cross_validate, RepeatedStratifiedKFold, cross_val_predict, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import StackingClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import balanced_accuracy_score, f1_score
+
 
 # 路径修复
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -18,9 +20,11 @@ project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
 
 from utils.utils import get_dim_reducer, get_classifier, save_model
+from utils.signed_log1p import SignedLog1pTransformer
+
 
 def run_training(args):
-    print(f"=== Training Start (Method: {args.dim_method} + {args.clf_method}) ===")
+    print(f"=== Training Start (Single Model + Global Alignment + OOF Threshold) ===")
     
     # ==========================================
     # 1. 加载数据
@@ -39,199 +43,244 @@ def run_training(args):
     y_train = train_df[target_col].values
     X_train = train_df.drop(target_col, axis=1)
     
-    num_pos = np.sum(y_train == 1)
-    num_neg = np.sum(y_train == 0)
-    print(f"Data Loaded. Shape: {X_train.shape}")
-    print(f"Class Balance: Pos={num_pos}, Neg={num_neg}")
-
-    # ==========================================
-    # 2. 特征工程 Step A: 方差过滤
-    # ==========================================
-    print(f"Step A: Variance Thresholding (threshold={args.var_threshold})...")
-    selector = VarianceThreshold(threshold=args.var_threshold)
-    X_train_var = selector.fit_transform(X_train) 
-    kept_cols = X_train.columns[selector.get_support()]
+    # 提取 Cross 特征用于无监督对齐
+    X_test_cross = test_cross_df[X_train.columns]
     
-    X_train_sub = pd.DataFrame(X_train_var, columns=kept_cols)
-    X_test_cross_sub = test_cross_df[kept_cols]
+    print(f"Data Loaded. Train: {X_train.shape}, Test Cross: {X_test_cross.shape}")
+
+    # ==========================================
+    # 2. 全局无监督对齐 (Global Alignment)
+    # ==========================================
+    print("\n🚀 Step A: Global Alignment (Fit Scaler/PCA on Train + Test Cross)...")
     
-    print(f"   -> Features reduced from {X_train.shape[1]} to {X_train_sub.shape[1]}")
+    X_all = pd.concat([X_train, X_test_cross], axis=0)
 
-    # ==========================================
-    # 3. 特征工程 Step 2: 标准化
-    # ==========================================
-    print("Step 2: Standardization...")
-    temp_scaler = StandardScaler()
-    # 仅用于 Step B 计算，后续 Pipeline 会重做
-    X_train_adv_scaled = pd.DataFrame(temp_scaler.fit_transform(X_train_sub), columns=kept_cols)
-    X_test_adv_scaled = pd.DataFrame(temp_scaler.transform(X_test_cross_sub), columns=kept_cols)
+    # 打印原始方差
+    variances = X_all.var()
+    print(f"   [Data Diagnosis] Original Min Var: {variances.min():.4f} | Max Var: {variances.max():.4f}")
+    
+    # 2.1 常量过滤 (threshold=0) - 必须先做这个，防止后续处理无效特征
+    selector_var = VarianceThreshold(threshold=0.0) 
+    selector_var.fit(X_all)
+    kept_cols = X_train.columns[selector_var.get_support()]
+    
+    X_train_sub = pd.DataFrame(selector_var.transform(X_train), columns=kept_cols)
+    X_test_cross_sub = pd.DataFrame(selector_var.transform(X_test_cross), columns=kept_cols)
+    
+    print(f"   -> Features reduced to {len(kept_cols)} (Constant features removed)")
+    save_model(kept_cols.tolist(), 'robust_features', args.model_dir)
 
-    # ==========================================
-    # 4. 特征工程 Step B: 对抗性筛选 (默认为 0，保留全量)
-    # ==========================================
-    if args.drop_adv_n > 0:
-        print(f"Step B: Adversarial Feature Selection (Dropping top {args.drop_adv_n})...")
-        adv_X = pd.concat([X_train_adv_scaled, X_test_adv_scaled], axis=0)
-        adv_y = np.array([0]*len(X_train_adv_scaled) + [1]*len(X_test_adv_scaled))
+    # ============================================================
+    # SignedLog1p 变换 (针对极大方差)
+    # ============================================================
+    print(f"   -> [Preprocessing] Applying SignedLog1p to compress dynamic range...")
+
+    log_tf = SignedLog1pTransformer()
+    # 注意：它通常不需要fit，但为了接口一致也可以fit
+    X_train_sub = pd.DataFrame(log_tf.fit_transform(X_train_sub), columns=kept_cols)
+    X_test_cross_sub = pd.DataFrame(log_tf.transform(X_test_cross_sub), columns=kept_cols)
+    def check_finite(df, name):
+        arr = df.to_numpy()
+        n_nan = np.isnan(arr).sum()
+        n_inf = np.isinf(arr).sum()
+        if n_nan or n_inf:
+            raise ValueError(f"{name} contains NaN/Inf (NaN={n_nan}, Inf={n_inf}).")
+    check_finite(X_train_sub, "X_train_sub(after log)")
+    check_finite(X_test_cross_sub, "X_test_cross_sub(after log)")
+    save_model(log_tf, 'log_transformer', args.model_dir)
+    
+    # 为了确认效果，可以打印一下变换后的方差（可选）
+    print(f"   -> Log-Transformed Max Var: {pd.concat([X_train_sub, X_test_cross_sub]).var().max():.4f}")
+    # ============================================================
+
+    # 重新合并用于后续的 Scaler 和 PCA 计算
+    X_all_sub = pd.concat([X_train_sub, X_test_cross_sub], axis=0)
+
+    # 2.2 全局标准化
+    global_scaler = StandardScaler()
+    global_scaler.fit(X_all_sub)
+    save_model(global_scaler, 'scaler', args.model_dir) 
+    
+    X_train_scaled = global_scaler.transform(X_train_sub)
+    X_all_scaled = global_scaler.transform(X_all_sub)
+    
+    # 2.3 全局降维 (Hybrid Fit)
+    final_reducer = None
+    X_train_ready = X_train_scaled 
+    
+    if args.dim_method != 'none':
+        reducer_kwargs = vars(args).copy()
+        for key in ['n_components', 'seed', 'data_dir', 'model_dir', 'clf_method', 'voters', 'voting_weights']:
+             if key in reducer_kwargs: del reducer_kwargs[key]
+             
+        fresh_reducer = get_dim_reducer(args.dim_method, args.n_components, args.seed, **reducer_kwargs)
         
-        adv_clf = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=args.seed, n_jobs=-1)
-        adv_clf.fit(adv_X, adv_y)
-        
-        imp = pd.Series(adv_clf.feature_importances_, index=kept_cols)
-        drop_cols = imp.nlargest(args.drop_adv_n).index
-        robust_features = [c for c in kept_cols if c not in drop_cols]
-        print(f"   -> Dropped {args.drop_adv_n} features.")
+        if hasattr(fresh_reducer, 'steps'): # Pipeline
+            selector_step = fresh_reducer.named_steps.get('selector') or fresh_reducer.named_steps.get('ensemble_selector')
+            pca_step = fresh_reducer.named_steps.get('pca')
+            
+            print(f"   -> Hybrid Fitting: Selector on Train, PCA on All...")
+            selector_step.fit(X_train_scaled, y_train) # 监督部分只看 Train
+            
+            X_all_selected = selector_step.transform(X_all_scaled)
+            pca_step.fit(X_all_selected) # 无监督部分看 All
+            
+            final_reducer = Pipeline([('selector', selector_step), ('pca', pca_step)])
+            X_train_ready = final_reducer.transform(X_train_scaled)
+        else: # Simple PCA
+            print(f"   -> Simple PCA: Fitting on All...")
+            fresh_reducer.fit(X_all_scaled)
+            final_reducer = fresh_reducer
+            X_train_ready = final_reducer.transform(X_train_scaled)
+            
+        save_model(final_reducer, 'dim_reducer', args.model_dir)
     else:
-        print(f"Step B: Skipping Adversarial Drop (drop_adv_n=0). Keeping all features.")
-        robust_features = kept_cols.tolist()
-    
-    print(f"   -> Final Feature Count: {len(robust_features)}")
-    save_model(robust_features, 'robust_features', args.model_dir)
-    X_train_final = X_train_sub[robust_features]
+        save_model(None, 'dim_reducer', args.model_dir)
 
     # ==========================================
-    # 5. 构建模型 (Stacking with ElasticNet)
+    # 3. 准备分类器
     # ==========================================
-    # 准备降维器参数，剔除冲突参数
-    reducer_kwargs = vars(args).copy()
-    for key in ['n_components', 'seed', 'data_dir', 'model_dir', 'clf_method', 'voters', 'voting_weights']:
-        if key in reducer_kwargs:
-            del reducer_kwargs[key]
-
-    reducer = get_dim_reducer(args.dim_method, args.n_components, args.seed, **reducer_kwargs)
+    # if args.clf_method == 'stacking':
+    #     voters_list = [v.strip() for v in args.voters.split(',')]
+    #     estimators = [(v, get_classifier(v, args.seed)) for v in voters_list]
+    #     meta_learner = LogisticRegression(
+    #         penalty="elasticnet", 
+    #         solver="saga", 
+    #         l1_ratio=0.5, 
+    #         C=0.5, 
+    #         class_weight="balanced", 
+    #         max_iter=5000, n_jobs=-1, random_state=args.seed)
+    #     clf = StackingClassifier(estimators=estimators, final_estimator=meta_learner, stack_method='predict_proba', cv=5, n_jobs=-1)
+    # else:
     clf = get_classifier(args.clf_method, args.seed, voters=args.voters)
 
-    print("\n" + "-"*30)
-    print(f"Running Repeated CV with {args.dim_method} + {args.clf_method}...")
-    print("-" * 30)
-        
-    pipeline_steps = [('scaler', StandardScaler())]
-    if reducer:
-        pipeline_steps.append(('reducer', reducer))
-    pipeline_steps.append(('clf', clf))
+    # ==========================================
+    # 4. CV 质检 (Sanity Check)
+    # ==========================================
+    # print("\n🔍 Step D: Running CV Sanity Check (Transductive Setting)...")
+    # cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=10, random_state=args.seed)
+    # scoring = {'acc': 'accuracy', 'auc': 'roc_auc'}
+    # cv_results = cross_validate(clf, X_train_ready, y_train, cv=cv, scoring=scoring, n_jobs=-1)
     
-    model_pipeline = Pipeline(pipeline_steps)
+    # mean_acc = cv_results['test_acc'].mean()
+    # mean_auc = cv_results['test_auc'].mean()
 
-    # 5x5 Repeated CV
+    # print(f"CV Accuracy : {mean_acc:.4f} (+/- {cv_results['test_acc'].std()*2:.4f})")
+    # print(f"CV AUC Score: {mean_auc:.4f} (+/- {cv_results['test_auc'].std()*2:.4f})")
+    print("\n🔍 Step D: Running CV (NO-LEAK, train-only pipeline)...")
+
+    # 只用训练集做 CV，所有 fit 都在 fold 内完成
+    reducer_kwargs = vars(args).copy()
+    for key in ['n_components', 'seed', 'data_dir', 'model_dir', 'clf_method', 'voters', 'voting_weights']:
+        reducer_kwargs.pop(key, None)
+
+    dim_reducer_for_cv = get_dim_reducer(args.dim_method, args.n_components, args.seed, **reducer_kwargs)
+
+    cv_pipeline = Pipeline([
+        ('var0', VarianceThreshold(threshold=0.0)),
+        ('log', SignedLog1pTransformer()),
+        ('scaler', StandardScaler()),
+        ('reducer', dim_reducer_for_cv),
+        ('clf', get_classifier(args.clf_method, args.seed, voters=args.voters)),
+    ])
+
+    cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=10, random_state=args.seed)
     scoring = {'acc': 'accuracy', 'auc': 'roc_auc'}
-    cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=5, random_state=args.seed)
+    cv_results = cross_validate(cv_pipeline, X_train, y_train, cv=cv, scoring=scoring, n_jobs=-1)
 
-    cv_results = cross_validate(model_pipeline, X_train_final, y_train, cv=cv, scoring=scoring, n_jobs=-1)
-    
     mean_acc = cv_results['test_acc'].mean()
     mean_auc = cv_results['test_auc'].mean()
-
-    print(f"CV Accuracy : {mean_acc:.4f} (+/- {cv_results['test_acc'].std()*2:.4f})")
-    print(f"CV AUC Score: {mean_auc:.4f} (+/- {cv_results['test_auc'].std()*2:.4f})")
-    print("-" * 30 + "\n")
+    print(f"CV Accuracy (no-leak): {mean_acc:.4f} (+/- {cv_results['test_acc'].std()*2:.4f})")
+    print(f"CV AUC (no-leak)     : {mean_auc:.4f} (+/- {cv_results['test_auc'].std()*2:.4f})")
 
     # ==========================================
-    # 6. 全量训练
+    # 5. OOF 阈值计算 & 全量训练
     # ==========================================
-    print(f"Retraining on FULL dataset for export...")
-    
-    final_scaler = StandardScaler()
-    X_train_scaled_final = final_scaler.fit_transform(X_train_final)
-    save_model(final_scaler, 'scaler', args.model_dir)
-    
-    if reducer:
-        print(f"   Fitting {args.dim_method} on full data...")
-        X_train_reduced = reducer.fit_transform(X_train_scaled_final, y_train)
-        save_model(reducer, 'dim_reducer', args.model_dir)
-    else:
-        X_train_reduced = X_train_scaled_final
-        save_model(None, 'dim_reducer', args.model_dir)
-        
-    print(f"   Fitting classifier on full data...")
-    clf.fit(X_train_reduced, y_train)
+    # print("\n🚀 Step E: Maximizing Metric on OOF Probabilities...")
+
+    # print("   -> Calculating OOF probabilities (5-Fold Stratified) [NO-LEAK end-to-end]...")
+    # cv_oof = StratifiedKFold(n_splits=5, shuffle=True, random_state=args.seed)
+
+    # # ✅ 用端到端 pipeline 计算 OOF 概率（包含 var/log/scaler/reducer/clf 的 fold 内拟合）
+    # oof_probs = cross_val_predict(
+    #     cv_pipeline,
+    #     X_train,
+    #     y_train,
+    #     cv=cv_oof,
+    #     method='predict_proba',
+    #     n_jobs=-1
+    # )[:, 1]
+
+    # thresholds = np.linspace(0.1, 0.9, 801)
+    # best_threshold, best_score = 0.5, -1.0
+    # metric_func = balanced_accuracy_score
+    # metric_name = "Balanced Acc"
+
+    # for th in thresholds:
+    #     preds = (oof_probs >= th).astype(int)
+    #     score = metric_func(y_train, preds)
+    #     if score > best_score:
+    #         best_score, best_threshold = score, th
+
+    # print(f"   Optimization Metric: {metric_name}")
+    # print(f"   Best Threshold Found: {best_threshold:.4f} (Score: {best_score:.4f})")
+    # print(f"   (Reference: Train Pos Rate was {np.mean(y_train):.4f})")
+
+    # save_model(float(best_threshold), 'threshold', args.model_dir)
+
+    # ==========================================
+    # 5. 阈值计算 & 全量训练
+    # ==========================================
+    print("\n🚀 Step E: Threshold Calibration & Final Training...")
+
+    # 先拟合最终 clf（你后面本来就要fit）
+    print("   -> Fitting final model on full data (global-aligned features)...")
+    clf.fit(X_train_ready, y_train)
     save_model(clf, 'model_unified', args.model_dir)
+
+    # 保存端到端最终Pipeline（你已有）
+    final_pipeline = Pipeline([
+        ('var0', selector_var),
+        ('log', log_tf),
+        ('scaler', global_scaler),
+        ('reducer', final_reducer),
+        ('clf', clf),
+    ])
+    save_model(final_pipeline, 'final_pipeline', args.model_dir)
+    print("  [Saved] final_pipeline.pkl")
+
+    # ✅ 用 final_pipeline 在训练集上出概率，并按训练先验(pos_rate)定阈值（口径匹配部署）
+    train_probs_final = final_pipeline.predict_proba(X_train)[:, 1]
+    pos_rate = float(np.mean(y_train))
+    percentile = 100.0 * (1.0 - pos_rate)
+    best_threshold = float(np.percentile(train_probs_final, percentile))
+
+    print(f"   Train Pos Rate: {pos_rate:.4f}")
+    print(f"   Calibrated Threshold (pos_rate on FINAL pipeline): {best_threshold:.4f} (at {percentile:.1f}th percentile)")
+    save_model(best_threshold, 'threshold', args.model_dir)
+
+    # 之后再用你现有的 global-aligned X_train_ready 去 fit 最终模型（用于推理）
+    print("   -> Fitting final model on full data (global-aligned features)...")
+    clf.fit(X_train_ready, y_train)
+    save_model(clf, 'model_unified', args.model_dir)
+
+    # ✅ NEW: 保存一个“端到端最终Pipeline”，避免推理时组件/阈值不匹配
+    final_pipeline = Pipeline([
+        ('var0', selector_var),       # fitted on X_all
+        ('log', log_tf),              # fitted (or stateless)
+        ('scaler', global_scaler),    # fitted on X_all_sub
+        ('reducer', final_reducer),   # fitted (hybrid)
+        ('clf', clf),                 # fitted on X_train_ready
+    ])
+    save_model(final_pipeline, 'final_pipeline', args.model_dir)
+    print("  [Saved] final_pipeline.pkl")
     
-    # 打印权重分析
     if isinstance(clf, StackingClassifier):
-        print_stacking_weights(clf)
+        meta_model = clf.final_estimator_
+        if hasattr(meta_model, 'coef_'):
+            print(f"   Meta Weights: {meta_model.coef_[0]}")
 
-    # ===============================================================
-    # 7. 伪标签 (Pseudo-Labeling)
-    # ===============================================================
-    print("\n" + "="*40)
-    print("🚀 FORCE START: Pseudo-Labeling Strategy")
-    print("="*40)
-
-    try:
-        X_test_full_ready = final_scaler.transform(X_test_cross_sub[robust_features])
-    except Exception as e:
-        print(f"   [Error] Preprocessing test data failed: {e}")
-        X_test_full_ready = None
-
-    if X_test_full_ready is not None:
-        if reducer:
-            X_test_reduced = reducer.transform(X_test_full_ready)
-        else:
-            X_test_reduced = X_test_full_ready
-
-        probs_test = clf.predict_proba(X_test_reduced)[:, 1]
-        
-        # 自适应阈值选择：从严到宽，确保能选出样本
-        selected_indices = []
-        for threshold in [0.95, 0.90, 0.85]:
-            high_conf_idx = np.where((probs_test >= threshold) | (probs_test <= (1 - threshold)))[0]
-            if len(high_conf_idx) >= 20: 
-                selected_indices = high_conf_idx
-                print(f"   [Pseudo] Threshold selected: {threshold}/{1-threshold:.2f}")
-                break
-        
-        # 兜底策略：如果还是太少，放宽到0.85强行选
-        if len(selected_indices) == 0 and len(high_conf_idx) > 0:
-            selected_indices = high_conf_idx
-            print(f"   [Pseudo] Threshold relaxed to: 0.85 (Found few samples)")
-
-        print(f"   [Pseudo] High Confidence Samples Found: {len(selected_indices)}")
-        
-        if len(selected_indices) > 0:
-            pseudo_X = X_test_reduced[selected_indices]
-            # 生成伪标签：>0.5设为1，<=0.5设为0
-            pseudo_y = (probs_test[selected_indices] > 0.5).astype(int)
-            
-            # 合并数据
-            X_aug = np.vstack([X_train_reduced, pseudo_X])
-            y_aug = np.concatenate([y_train, pseudo_y])
-            
-            print(f"   [Pseudo] Retraining with Augmented Data: {len(y_train)} -> {len(y_aug)} samples")
-            
-            # 重新训练模型（覆盖原模型）
-            clf.fit(X_aug, y_aug)
-            save_model(clf, 'model_unified_pseudo', args.model_dir)
-            print("   ✅ [Pseudo] Boosted Model Saved as 'model_unified_pseudo.pkl'!")
-        else:
-            print("   ⚠️ [Pseudo] No confident samples found. Keeping original model.")
-            save_model(clf, 'model_unified_pseudo', args.model_dir)
-
-    print("=== Training Done ===")
-
-def print_stacking_weights(clf):
-    print("\n" + "="*40)
-    print("🕵️ Stacking Meta-Learner Weights Analysis")
-    print("=" * 40)
-    meta_model = clf.final_estimator_
-    
-    if hasattr(meta_model, 'coef_'):
-        coefs = meta_model.coef_[0]
-        base_names = list(clf.named_estimators_.keys())
-        
-        print(f"Meta Learner Intercept: {meta_model.intercept_[0]:.4f}")
-        print("-" * 40)
-        
-        if len(coefs) == len(base_names) * 2: # 二分类且 output=predict_proba
-            print(f"{'Base Learner':<15} | {'Class 0 Weight':<15} | {'Class 1 Weight':<15}")
-            print("-" * 40)
-            for i, name in enumerate(base_names):
-                w0 = coefs[2*i]
-                w1 = coefs[2*i+1]
-                print(f"{name:<15} | {w0: .4f}          | {w1: .4f}")
-        else:
-            print(f"Raw Coefficients: {coefs}")
-            print(f"Base Estimators: {base_names}")
-    print("=" * 40 + "\n")
+    print("\n=== Training Done ===")
 
 if __name__ == "__main__":
     base_dir = Path(__file__).resolve().parents[1]
@@ -242,16 +291,15 @@ if __name__ == "__main__":
     ## default 里保存 SOTA
     parser.add_argument('--dim_method', default='ensemble_spca')
     parser.add_argument('--clf_method', default='stacking')
-    parser.add_argument('--voters', type=str, default="lr,svm_calib,xgb")
-    parser.add_argument('--n_components', type=int, default=80)
-    parser.add_argument('--drop_adv_n', type=int, default=0) # 默认不丢弃
-    parser.add_argument('--spca_k', type=int, default=2000)
-    parser.add_argument('--var_threshold', type=float, default=0.01)
+    parser.add_argument('--voters', type=str, default="rf,svm_calib,xgb")
+    parser.add_argument('--n_components', type=int, default=100)
+    parser.add_argument('--spca_k', type=int, default=2500)
+    # parser.add_argument('--drop_adv_n', type=int, default=0) # 默认不丢弃
+    # parser.add_argument('--var_threshold', type=float, default=0.0)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--ens_verbose', action='store_true',
                         help="Print verbose logs inside EnsembleSelector (may be noisy under parallel CV).")
-
-    # 兼容参数
+    
     parser.add_argument('--voting_weights', type=str, default=None)
     parser.add_argument('--ens_l1_c', type=float, default=1.0)
     parser.add_argument('--ens_mi_k', type=int, default=3)
@@ -259,3 +307,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     os.makedirs(args.model_dir, exist_ok=True)
     run_training(args)
+
+

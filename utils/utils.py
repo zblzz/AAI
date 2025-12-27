@@ -124,7 +124,7 @@ def get_classifier(method_name, seed=42, **kwargs):
             reg_lambda=3, 
             eval_metric='logloss',
             random_state=seed, 
-            n_jobs=-1
+            n_jobs=1
         )
         # return XGBClassifier(
         #     n_estimators=100,       # [砍] 减少树的数量，防止过拟合
@@ -175,14 +175,14 @@ def get_classifier(method_name, seed=42, **kwargs):
             C=1.0,
             class_weight="balanced",
             max_iter=5000,
-            n_jobs=-1,
+            n_jobs=1,
             random_state=seed
         )
     elif method_name == 'knn':
         # n_neighbors=7: 稍微大一点，增加鲁棒性（一般取 3-9）
         # weights='distance': 距离近的样本权重更大，比 uniform 更适合
         # metric='euclidean': 因为你做了 PCA，特征已经去相关了，欧氏距离有效
-        return KNeighborsClassifier(n_neighbors=7, weights='distance', metric='euclidean', n_jobs=-1)
+        return KNeighborsClassifier(n_neighbors=7, weights='distance', metric='euclidean', n_jobs=1)
     elif method_name == 'voting':
         voters_str = kwargs.pop('voters', 'lr,svm_calib,xgb')
         voters_list = [v.strip() for v in voters_str.split(',')]
@@ -194,7 +194,7 @@ def get_classifier(method_name, seed=42, **kwargs):
             estimators.append((v_name, clf))
             
         print(f"   [Voting] Voters: {voters_list} | Weights: {weights}")
-        return VotingClassifier(estimators=estimators, voting='soft', weights=weights, n_jobs=-1)
+        return VotingClassifier(estimators=estimators, voting='soft', weights=weights, n_jobs=1)
     
     elif method_name == 'stacking':
         # Stacking 需要保留 voters 参数
@@ -214,10 +214,10 @@ def get_classifier(method_name, seed=42, **kwargs):
             penalty="elasticnet",
             solver="saga",      # 唯一支持 elasticnet 的求解器
             l1_ratio=0.5,       # 50% L1, 50% L2 (均衡策略)
-            C=0.3,              # 正则力度 (C=0.3~0.5 都是最佳甜点区)
+            C=1.0,              # 正则力度 (C=0.3~0.5 都是最佳甜点区)
             class_weight="balanced",
             max_iter=5000,
-            n_jobs=-1,
+            n_jobs=1,
             random_state=seed
         )
         print(f"   [Stacking] Meta Learner: LogisticRegression")
@@ -227,7 +227,7 @@ def get_classifier(method_name, seed=42, **kwargs):
             final_estimator=final_estimator,
             stack_method='predict_proba',
             cv=5,
-            n_jobs=-1
+            n_jobs=1
         )
     else:
         raise ValueError(f"Unknown method: {method_name}")
