@@ -1,5 +1,6 @@
 # AAI Project
 
+
 本项目提供训练与推理脚本，用于二分类任务：
 - **Task 1**：in-domain 测试集
 - **Task 2**：cross-domain 测试集（目标域分布不同）
@@ -117,6 +118,7 @@ python scripts/infer.py
 5. 最终训练与阈值校准：
    - 训练最终模型并保存 `final_pipeline.pkl`
    - 在训练集上预测概率，并按训练正例率分位点生成阈值 `threshold.pkl`
+
 
 #### 主要参数
 - `--data_dir`：数据目录（默认 `./data`）
