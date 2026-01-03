@@ -109,7 +109,7 @@ def get_classifier(method_name, seed=42, **kwargs):
                                   class_weight='balanced', random_state=seed)
     
     elif method_name == 'rf':
-        return RandomForestClassifier(n_estimators=100, max_depth=7, 
+        return RandomForestClassifier(n_estimators=200, max_depth=7, 
                                       class_weight='balanced', random_state=seed)
     
     elif method_name == 'xgb':

@@ -68,9 +68,10 @@ if __name__ == "__main__":
 
     print(f"=== Inference Start (Adaptive Threshold) ===")
 
-    pipeline = load_model('final_pipeline', args.model_dir)
+    pipeline = load_model('model', args.model_dir)
     threshold = load_model('threshold', args.model_dir)
-    print(f"✅ Loaded final_pipeline.pkl")
+    # threshold=0.5
+    print(f"✅ Loaded model.pkl")
     print(f"✅ Loaded threshold: {float(threshold):.4f}")
 
     task1_input = os.path.join(args.data_dir, 'test_in_domain.csv')

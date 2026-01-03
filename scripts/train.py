@@ -233,48 +233,37 @@ def run_training(args):
     # ==========================================
     print("\n🚀 Step E: Threshold Calibration & Final Training...")
 
-    # 先拟合最终 clf（你后面本来就要fit）
     print("   -> Fitting final model on full data (global-aligned features)...")
     clf.fit(X_train_ready, y_train)
     save_model(clf, 'model_unified', args.model_dir)
 
-    # 保存端到端最终Pipeline（你已有）
-    final_pipeline = Pipeline([
+    # Pipeline 不能包含 None step
+    steps = [
         ('var0', selector_var),
         ('log', log_tf),
         ('scaler', global_scaler),
-        ('reducer', final_reducer),
-        ('clf', clf),
-    ])
-    save_model(final_pipeline, 'final_pipeline', args.model_dir)
-    print("  [Saved] final_pipeline.pkl")
+    ]
+    if final_reducer is not None:
+        steps.append(('reducer', final_reducer))
+    steps.append(('clf', clf))
 
-    # ✅ 用 final_pipeline 在训练集上出概率，并按训练先验(pos_rate)定阈值（口径匹配部署）
+    final_pipeline = Pipeline(steps)
+    save_model(final_pipeline, 'model', args.model_dir)
+    print("  [Saved] model.pkl")
+
+    # pos_rate 阈值（与你现在一致）
     train_probs_final = final_pipeline.predict_proba(X_train)[:, 1]
     pos_rate = float(np.mean(y_train))
     percentile = 100.0 * (1.0 - pos_rate)
     best_threshold = float(np.percentile(train_probs_final, percentile))
-
-    print(f"   Train Pos Rate: {pos_rate:.4f}")
-    print(f"   Calibrated Threshold (pos_rate on FINAL pipeline): {best_threshold:.4f} (at {percentile:.1f}th percentile)")
     save_model(best_threshold, 'threshold', args.model_dir)
 
-    # 之后再用你现有的 global-aligned X_train_ready 去 fit 最终模型（用于推理）
-    print("   -> Fitting final model on full data (global-aligned features)...")
-    clf.fit(X_train_ready, y_train)
-    save_model(clf, 'model_unified', args.model_dir)
+    # ✅ 自检：训练集上预测正例率应接近 pos_rate
+    preds_train = (train_probs_final >= best_threshold).astype(int)
+    print(f"   Train Pos Rate                   : {pos_rate:.4f}")
+    print(f"   Threshold (pos_rate percentile)  : {best_threshold:.4f} (at {percentile:.1f}th)")
+    print(f"   [Self-Check] Train Pred Pos Rate : {preds_train.mean():.4f}")
 
-    # ✅ NEW: 保存一个“端到端最终Pipeline”，避免推理时组件/阈值不匹配
-    final_pipeline = Pipeline([
-        ('var0', selector_var),       # fitted on X_all
-        ('log', log_tf),              # fitted (or stateless)
-        ('scaler', global_scaler),    # fitted on X_all_sub
-        ('reducer', final_reducer),   # fitted (hybrid)
-        ('clf', clf),                 # fitted on X_train_ready
-    ])
-    save_model(final_pipeline, 'final_pipeline', args.model_dir)
-    print("  [Saved] final_pipeline.pkl")
-    
     if isinstance(clf, StackingClassifier):
         meta_model = clf.final_estimator_
         if hasattr(meta_model, 'coef_'):
@@ -291,9 +280,9 @@ if __name__ == "__main__":
     ## default 里保存 SOTA
     parser.add_argument('--dim_method', default='ensemble_spca')
     parser.add_argument('--clf_method', default='stacking')
-    parser.add_argument('--voters', type=str, default="rf,svm_calib,xgb")
-    parser.add_argument('--n_components', type=int, default=100)
-    parser.add_argument('--spca_k', type=int, default=2500)
+    parser.add_argument('--voters', type=str, default="lr,svm_calib,xgb")
+    parser.add_argument('--n_components', type=int, default=120)
+    parser.add_argument('--spca_k', type=int, default=3000)
     # parser.add_argument('--drop_adv_n', type=int, default=0) # 默认不丢弃
     # parser.add_argument('--var_threshold', type=float, default=0.0)
     parser.add_argument('--seed', type=int, default=42)
